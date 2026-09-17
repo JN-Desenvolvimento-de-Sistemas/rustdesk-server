@@ -1,0 +1,12 @@
+{
+  "version": "1.4.9",
+  "url": "https://github.com/rustdesk/rustdesk/releases/download/1.4.9/rustdesk-1.4.9-x86_64.exe",
+  "sha256": "eaedeb0088e687bf46f7c46a9c6ea5493ce51f3134dfd6acbedb47b5b9136274",
+  "source_revision": "7423dced37845c48093b6f71bd82e4a16cc8c79d",
+  "server": {
+    "host": "rustdesk.app.br",
+    "relay": "rustdesk.app.br:21117",
+    "api": "https://rustdesk.api.br",
+    "key": "uUr3v6kReOdHqYwnnHnFmxI6g50UM0xgjtvUIt6kysY="
+  }
+}

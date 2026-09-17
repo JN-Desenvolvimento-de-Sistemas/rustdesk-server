@@ -1,0 +1,41 @@
+name: Build and validate Windows installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Validate PowerShell syntax
+        shell: powershell
+        run: |
+          Get-ChildItem packaging/windows -Include *.ps1,*.psm1 -Recurse | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+      - name: Compile installer
+        shell: powershell
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed' }
+      - name: Install and verify on Windows
+        shell: powershell
+        run: ./packaging/windows/test-installer.ps1
+      - name: Generate checksums
+        shell: powershell
+        run: |
+          $exe = 'packaging/windows/output/Instalar-RustDesk-JN.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Instalar-RustDesk-JN.exe" | Set-Content packaging/windows/output/SHA256SUMS.txt -Encoding ASCII
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-installer
+          path: packaging/windows/output/
+          if-no-files-found: error
+          retention-days: 14

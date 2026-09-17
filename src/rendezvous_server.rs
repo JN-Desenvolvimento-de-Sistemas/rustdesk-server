@@ -441,10 +441,10 @@ impl RendezvousServer {
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    self.handle_hole_sent(phs, addr, Some(socket)).await?;
+                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    self.handle_local_addr(la, addr, Some(socket)).await?;
+                    // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -508,10 +508,13 @@ impl RendezvousServer {
                     if !secured { return false; }
                     let peer = match self.pm.get_in_memory(&rf.id).await { Some(peer) => peer, None => return false };
                     let target_ip = try_into_v4(peer.read().await.socket_addr).ip().to_string();
-                    if !crate::adm::api("authorize-connection", serde_json::json!({
+                    if let Some(response) = crate::adm::connection_authorization(serde_json::json!({
                         "destination_identity": self.pm.adm_peer(&rf.id).await, "token": rf.token, "destination_id": rf.id, "attempt_id": uuid::Uuid::new_v4().to_string(),
                         "relay_uuid": rf.uuid, "source_ip": try_into_v4(addr).ip().to_string(), "destination_ip": target_ip,
-                    })).await { return false; }
+                    })).await.relay_response() {
+                        Self::send_to_sink(sink, response).await;
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -532,10 +535,13 @@ impl RendezvousServer {
                         let pending = PENDING_AUTHORIZATION.lock().await.remove(&try_into_v4(addr_b));
                         let pending = match pending { Some(pending) => pending, None => return false };
                         if pending.created.elapsed().as_secs() >= 30 || pending.target_ip != try_into_v4(addr).ip() || pending.destination != rr.id() { return false; }
-                        if !crate::adm::api("authorize-connection", serde_json::json!({
+                        if let Some(response) = crate::adm::connection_authorization(serde_json::json!({
                             "destination_identity": self.pm.adm_peer(&pending.destination).await, "token": pending.token, "destination_id": pending.destination, "attempt_id": uuid::Uuid::new_v4().to_string(),
                             "relay_uuid": rr.uuid, "source_ip": try_into_v4(addr_b).ip().to_string(), "destination_ip": pending.target_ip.to_string(),
-                        })).await { return false; }
+                        })).await.relay_response() {
+                            self.send_to_tcp(response, addr_b).await;
+                            return false;
+                        }
                     }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
@@ -710,8 +716,8 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if !crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await {
-            return Ok((crate::adm::access_denied_response(), None));
+        if let Some(response) = crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await.punch_response() {
+            return Ok((response, None));
         }
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -1405,4 +1411,63 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    async fn fixture() -> (RendezvousServer, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("rustdesk-regression-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = crate::database::Database::new(path.to_str().unwrap()).await.unwrap();
+        let (tx, _) = mpsc::unbounded_channel();
+        (RendezvousServer {
+            tcp_punch: Default::default(), pm: PeerMap::with_test_database(db), tx,
+            relay_servers: Default::default(), relay_servers0: Default::default(), rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner { serial: 0, version: String::new(), software_url: String::new(), mask: None, local_ip: String::new(), sk: None }),
+        }, path)
+    }
+
+    #[tokio::test]
+    async fn udp_connection_messages_cannot_reflect_to_other_addresses() {
+        let (mut server, path) = fixture().await;
+        server.pm.get_or("123456789").await;
+        let mut socket = FramedSocket::new("127.0.0.1:0").await.unwrap();
+        let victim = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = victim.local_addr().unwrap();
+        let mut punch = RendezvousMessage::new();
+        punch.set_punch_hole_request(PunchHoleRequest { id: "123456789".into(), ..Default::default() });
+        let mut sent = RendezvousMessage::new();
+        sent.set_punch_hole_sent(PunchHoleSent { socket_addr: AddrMangle::encode(addr).into(), ..Default::default() });
+        let mut local = RendezvousMessage::new();
+        local.set_local_addr(LocalAddr { socket_addr: AddrMangle::encode(addr).into(), local_addr: AddrMangle::encode(addr).into(), ..Default::default() });
+        for message in [punch, sent, local] {
+            server.handle_udp(&BytesMut::from(message.write_to_bytes().unwrap().as_slice()), addr, &mut socket, "").await.unwrap();
+            let mut buffer = [0u8; 2048];
+            assert!(tokio::time::timeout(Duration::from_millis(50), victim.recv_from(&mut buffer)).await.is_err());
+        }
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn peers_offline_for_thirty_days_do_not_overflow_to_online() {
+        let (mut server, path) = fixture().await;
+        let ids = vec!["fresh".to_owned(), "thirty-days".to_owned(), "fifty-days".to_owned()];
+        for (id, days) in ids.iter().zip([0, 30, 50]) {
+            server.pm.get_or(id).await.write().await.last_reg_time = Instant::now() - Duration::from_secs(days * 86400);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = FramedStream::from(TcpStream::connect(addr).await.unwrap(), addr);
+        let (socket, peer) = listener.accept().await.unwrap();
+        let mut stream = FramedStream::from(socket, peer);
+        server.handle_online_request(&mut stream, ids).await.unwrap();
+        let response = client.next_timeout(2000).await.unwrap().unwrap();
+        let response = RendezvousMessage::parse_from_bytes(&response).unwrap();
+        assert_eq!(response.online_response().states.as_ref(), &[0b1000_0000]);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
 }

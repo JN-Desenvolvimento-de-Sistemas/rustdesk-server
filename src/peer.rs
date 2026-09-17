@@ -66,6 +66,11 @@ pub(crate) struct PeerMap {
 }
 
 impl PeerMap {
+    #[cfg(test)]
+    pub(crate) fn with_test_database(db: database::Database) -> Self {
+        Self { map: Default::default(), db }
+    }
+
     pub(crate) async fn adm_peer(&self, id: &str) -> Option<serde_json::Value> {
         let peer = self.get_in_memory(id).await?;
         let peer = peer.read().await;

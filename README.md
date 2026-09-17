@@ -6,7 +6,7 @@ Licença: [GNU AGPL v3](LICENSE). Os avisos e o histórico do projeto original f
 
 ## Origem
 
-- Servidor: https://github.com/rustdesk/rustdesk-server, commit `9bae9f2f39d92c4b4ba2e28e089da5071897b22e` (tag upstream `1.1.15`; o Cargo.toml original informa `1.1.14`).
+- Servidor: https://github.com/rustdesk/rustdesk-server, commit `73523b31cfd25d77dee862e6fc9f5e1fb5e485ef` (tag upstream `1.1.16`), com a correção adicional de UDP `109d9a235136c883f544cb3ea0f11a58f1cedd58`.
 - Biblioteca incorporada: https://github.com/rustdesk/hbb_common, commit `83419b6549636ee39dacef7776c473f5802e08d6`. Seu código está em `libs/hbb_common`, inclusive nos downloads ZIP; não é preciso inicializar submódulos.
 - Documentação original: [README.upstream.md](README.upstream.md).
 
@@ -20,10 +20,10 @@ cd rustdesk-server
 docker buildx build --platform linux/amd64 --provenance=false --load -t rustdesk-server-jn:local .
 ```
 
-O build executa `cargo test --locked --release --lib adm::tests` antes de compilar `hbbs` e `hbbr`. Em Debian Bookworm com Rust 1.90, protobuf-compiler, pkg-config, libssl-dev e libsodium-dev instalados:
+O build executa `cargo test --locked --release --lib` antes de compilar `hbbs` e `hbbr`. Em Debian Bookworm com Rust 1.90, protobuf-compiler, pkg-config, libssl-dev e libsodium-dev instalados:
 
 ```sh
-SODIUM_USE_PKG_CONFIG=1 cargo test --locked --release --lib adm::tests
+SODIUM_USE_PKG_CONFIG=1 cargo test --locked --release --lib
 SODIUM_USE_PKG_CONFIG=1 cargo build --locked --release --bin hbbs --bin hbbr
 ```
 

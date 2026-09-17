@@ -5,7 +5,7 @@ RUN rustup target add x86_64-unknown-linux-gnu
 WORKDIR /src
 COPY . /src
 ENV SODIUM_USE_PKG_CONFIG=1 CARGO_BUILD_JOBS=4
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo clean -p hbbs --release && cargo test --locked --release --lib adm::tests
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/src/target cargo clean -p hbbs --release && cargo test --locked --release --lib
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
     CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \

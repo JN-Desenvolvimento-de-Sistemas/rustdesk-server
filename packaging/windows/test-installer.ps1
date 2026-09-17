@@ -23,7 +23,13 @@ New-NetFirewallRule -DisplayName 'RustDesk installer CI isolation' -Direction Ou
 $setup = Join-Path $PSScriptRoot 'output\Instalar-RustDesk-JN.exe'
 $log = Join-Path $env:TEMP 'rustdesk-jn-setup-test.log'
 $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$log") -PassThru
-if (-not $process.WaitForExit(300000)) { $process.Kill(); throw 'Installer timed out' }
+if (-not $process.WaitForExit(300000)) {
+    Get-ChildItem $env:TEMP -Directory -Filter 'is-*' | ForEach-Object {
+        $progressLog = Join-Path $_.FullName 'progress.log'
+        if (Test-Path $progressLog) { Get-Content $progressLog -Tail 15 }
+    }
+    $process.Kill(); throw 'Installer timed out'
+}
 if ($process.ExitCode -ne 0) { Get-Content $log -Tail 30; throw "Installer exit code $($process.ExitCode)" }
 Assert-True (Test-Path $exe) 'RustDesk executable missing'
 Assert-True ((Get-Service RustDesk).Status -eq 'Running') 'Service not running'
@@ -32,6 +38,7 @@ foreach ($name in $settings.Keys) {
     Assert-True ((Invoke-RustDesk $exe @('--option', $name)) -ceq $settings[$name]) "Native option not configured: $name"
 }
 $id = Invoke-RustDesk $exe @('--get-id')
+Assert-True ($id -match '^\d{6,}$') 'Device ID was not initialized'
 Invoke-RustDesk $exe @('--option', 'enable-audio', 'N') | Out-Null
 $process = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$log") -PassThru
 if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'Reconfiguration timed out' }

@@ -19,7 +19,7 @@ function Assert-DownloadHash {
 }
 
 function Invoke-RustDesk {
-    param([string]$Path, [string[]]$Arguments, [int]$TimeoutSeconds = 30)
+    param([string]$Path, [string[]]$Arguments, [int]$TimeoutSeconds = 30, [switch]$IgnoreOutput)
     $quoted = foreach ($arg in $Arguments) {
         if ($arg -match '["\r\n]') { throw 'Argumento inválido na configuração.' }
         '"' + $arg + '"'
@@ -29,20 +29,24 @@ function Invoke-RustDesk {
     $start.Arguments = $quoted -join ' '
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
+    $start.RedirectStandardOutput = -not $IgnoreOutput
+    $start.RedirectStandardError = -not $IgnoreOutput
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     try {
         if (-not $process.Start()) { throw 'Não foi possível iniciar o RustDesk.' }
-        $output = $process.StandardOutput.ReadToEndAsync()
-        $errors = $process.StandardError.ReadToEndAsync()
+        if (-not $IgnoreOutput) {
+            $output = $process.StandardOutput.ReadToEndAsync()
+            $errors = $process.StandardError.ReadToEndAsync()
+        }
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
             $process.Kill()
             throw 'O RustDesk demorou demais para responder. Tente novamente após verificar o serviço.'
         }
         $process.WaitForExit()
         if ($process.ExitCode -ne 0) { throw "O RustDesk retornou erro $($process.ExitCode)." }
+        if ($IgnoreOutput) { return '' }
+        if (-not $output.Wait(5000)) { throw 'Não foi possível ler a resposta do RustDesk.' }
         return $output.Result.Trim()
     } finally {
         $process.Dispose()
@@ -90,7 +94,7 @@ function Wait-RustDeskService {
     param([string]$Path)
     $service = Get-Service -Name RustDesk -ErrorAction SilentlyContinue
     if (-not $service) {
-        Invoke-RustDesk -Path $Path -Arguments @('--install-service') -TimeoutSeconds 60 | Out-Null
+        Invoke-RustDesk -Path $Path -Arguments @('--install-service') -TimeoutSeconds 60 -IgnoreOutput | Out-Null
     }
     $deadline = (Get-Date).AddSeconds(60)
     do {
@@ -139,7 +143,7 @@ function Install-ConfiguredRustDesk {
     if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
         throw 'Este instalador requer Windows x64 (Intel ou AMD).'
     }
-    $manifest = Read-ClientManifest $ManifestPath
+    Write-Host 'Validando instalação existente...'; $manifest = Read-ClientManifest $ManifestPath
     $path = Get-InstalledRustDesk
     $version = if ($path) { Get-RustDeskVersion $path } else { '' }
     $decision = Get-InstallDecision $version $manifest.version
@@ -155,10 +159,10 @@ function Install-ConfiguredRustDesk {
             $download = Join-Path $work 'rustdesk.exe'
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $ProgressPreference = 'SilentlyContinue'
-            try { Invoke-WebRequest -UseBasicParsing -Uri $manifest.url -OutFile $download -TimeoutSec 180 }
+            Write-Host 'Baixando o cliente oficial...'; try { Invoke-WebRequest -UseBasicParsing -Uri $manifest.url -OutFile $download -TimeoutSec 180 }
             catch { throw 'Não foi possível baixar o RustDesk oficial. Verifique a conexão com a internet e tente novamente.' }
-            Assert-DownloadHash $download $manifest.sha256
-            Invoke-RustDesk -Path $download -Arguments @('--silent-install') -TimeoutSeconds 180 | Out-Null
+            Write-Host 'Verificando integridade do download...'; Assert-DownloadHash $download $manifest.sha256
+            Write-Host 'Executando instalador oficial...'; Invoke-RustDesk -Path $download -Arguments @('--silent-install') -TimeoutSeconds 180 -IgnoreOutput | Out-Null
             $deadline = (Get-Date).AddSeconds(60)
             do {
                 $path = Get-InstalledRustDesk
@@ -172,8 +176,8 @@ function Install-ConfiguredRustDesk {
             Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
-    Wait-RustDeskService $path
-    Set-RustDeskNetwork $path $manifest.server
+    Write-Host 'Aguardando serviço...'; Wait-RustDeskService $path
+    Write-Host 'Aplicando e confirmando configuração...'; Set-RustDeskNetwork $path $manifest.server
     $afterId = Invoke-RustDesk -Path $path -Arguments @('--get-id')
     if ($beforeId -and $afterId -cne $beforeId) {
         throw 'O identificador do dispositivo mudou. Entre em contato com o administrador antes de continuar.'

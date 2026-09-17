@@ -1,0 +1,446 @@
+diff --git a/src/hbbr.rs b/src/hbbr.rs
+index 4c8a784..fb511a3 100644
+--- a/src/hbbr.rs
++++ b/src/hbbr.rs
+@@ -1,3 +1,4 @@
++mod adm;
+ use clap::App;
+ mod common;
+ mod relay_server;
+diff --git a/src/lib.rs b/src/lib.rs
+index 8da29a2..dd0c6b3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,3 +4,5 @@ pub mod common;
+ mod database;
+ mod peer;
+ mod version;
++
++pub mod adm;
+diff --git a/src/peer.rs b/src/peer.rs
+index 4ca87cf..c16da94 100644
+--- a/src/peer.rs
++++ b/src/peer.rs
+@@ -66,6 +66,26 @@ pub(crate) struct PeerMap {
+ }
+ 
+ impl PeerMap {
++    pub(crate) async fn adm_peer(&self, id: &str) -> Option<serde_json::Value> {
++        let peer = self.get_in_memory(id).await?;
++        let peer = peer.read().await;
++        if peer.pk.is_empty() || peer.uuid.is_empty() || peer.last_reg_time.elapsed().as_secs() > 60 { return None; }
++        let fingerprint: String = sodiumoxide::crypto::hash::sha256::hash(&peer.pk).0.iter().map(|byte| format!("{:02x}", byte)).collect();
++        Some(serde_json::json!({"uuid": base64::encode(&peer.uuid), "fingerprint": fingerprint}))
++    }
++
++    pub(crate) async fn adm_snapshot(&self) -> Vec<serde_json::Value> {
++        let peers: Vec<_> = self.map.read().await.iter().map(|(id, peer)| (id.clone(), peer.clone())).collect();
++        let mut result = Vec::new();
++        for (id, peer) in peers {
++            let peer = peer.read().await;
++            if peer.pk.is_empty() || peer.uuid.is_empty() || peer.last_reg_time.elapsed().as_secs() > 60 { continue; }
++            let fingerprint: String = sodiumoxide::crypto::hash::sha256::hash(&peer.pk).0.iter().map(|byte| format!("{:02x}", byte)).collect();
++            result.push(serde_json::json!({"id": id, "uuid": base64::encode(&peer.uuid), "fingerprint": fingerprint, "seen_seconds_ago": peer.last_reg_time.elapsed().as_secs().min(86400)}));
++        }
++        result
++    }
++
+     pub(crate) async fn new() -> ResultType<Self> {
+         let db = std::env::var("DB_URL").unwrap_or({
+             let mut db = "db_v2.sqlite3".to_owned();
+diff --git a/src/relay_server.rs b/src/relay_server.rs
+index 0ec190a..cd22ddc 100644
+--- a/src/relay_server.rs
++++ b/src/relay_server.rs
+@@ -392,29 +392,13 @@ async fn handle_connection(
+ 
+ async fn make_pair(
+     stream: TcpStream,
+-    mut addr: SocketAddr,
++    addr: SocketAddr,
+     key: &str,
+     limiter: Limiter,
+     ws: bool,
+ ) -> ResultType<()> {
+     if ws {
+-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+-        let callback = |req: &Request, response: Response| {
+-            let headers = req.headers();
+-            let real_ip = headers
+-                .get("X-Real-IP")
+-                .or_else(|| headers.get("X-Forwarded-For"))
+-                .and_then(|header_value| header_value.to_str().ok());
+-            if let Some(ip) = real_ip {
+-                if ip.contains('.') {
+-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
+-                } else {
+-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+-                }
+-            }
+-            Ok(response)
+-        };
+-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
++        let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+         make_pair_(ws_stream, addr, key, limiter).await;
+     } else {
+         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+@@ -432,8 +416,20 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                     return;
+                 }
+                 if !rf.uuid.is_empty() {
+-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
+-                    if let Some(peer) = peer.as_mut() {
++                    if uuid::Uuid::parse_str(&rf.uuid).is_err() { return; }
++                    let mut admitted = false;
++                    for _ in 0..10 {
++                        if crate::adm::api(&format!("relay/{}/claim", rf.uuid), serde_json::json!({"ip": hbb_common::try_into_v4(addr).ip().to_string()})).await {
++                            admitted = true; break;
++                        }
++                        tokio::time::sleep(Duration::from_millis(200)).await;
++                    }
++                    if !admitted { return; }
++                    let mut peers = PEERS.lock().await;
++                    let mut paired_stream = peers.remove(&rf.uuid);
++                    if let Some(peer_stream) = paired_stream.as_mut() {
++                        drop(peers);
++                        let peer = peer_stream;
+                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
+                         let id = format!("{}:{}", addr.ip(), addr.port());
+                         USAGE.write().await.insert(id.clone(), Default::default());
+@@ -442,7 +438,19 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                             stream.set_raw();
+                             log::info!("Both are raw");
+                         }
+-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
++                        let result = tokio::select! {
++                            result = relay(addr, &mut stream, peer, limiter, id.clone()) => result,
++                            _ = async {
++                                loop {
++                                    if !crate::adm::api(&format!("relay/{}/status", rf.uuid), serde_json::json!({})).await { break; }
++                                    tokio::time::sleep(Duration::from_secs(5)).await;
++                                }
++                            } => Err(hbb_common::anyhow::anyhow!("Session authorization revoked or unavailable")),
++                        };
++                        drop(stream);
++                        drop(paired_stream);
++                        crate::adm::api(&format!("relay/{}/close", rf.uuid), serde_json::json!({})).await;
++                        if let Err(err) = result
+                         {
+                             log::info!("Relay of {} closed: {}", addr, err);
+                         } else {
+@@ -451,7 +459,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                         USAGE.write().await.remove(&id);
+                     } else {
+                         log::info!("New relay request {} from {}", rf.uuid, addr);
+-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
++                        peers.insert(rf.uuid.clone(), Box::new(stream));
++                        drop(peers);
+                         sleep(30.).await;
+                         PEERS.lock().await.remove(&rf.uuid);
+                     }
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index efe6330..ad5f8e1 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -3,7 +3,6 @@ use crate::peer::*;
+ use hbb_common::{
+     allow_err, bail,
+     bytes::{Bytes, BytesMut},
+-    bytes_codec::BytesCodec,
+     config,
+     futures::future::join_all,
+     futures_util::{
+@@ -47,8 +46,11 @@ enum Data {
+     RelayServers(RelayServers),
+ }
+ 
++struct PendingAuthorization { token: String, destination: String, target_ip: IpAddr, created: Instant }
++static PENDING_AUTHORIZATION: Lazy<TokioMutex<HashMap<SocketAddr, PendingAuthorization>>> = Lazy::new(|| TokioMutex::new(HashMap::new()));
++
+ const REG_TIMEOUT: i32 = 30_000;
+-type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
++type TcpStreamSink = SplitSink<Framed<TcpStream, crate::adm::SecureCodec>, Bytes>;
+ type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+ enum Sink {
+     TcpStream(TcpStreamSink),
+@@ -147,6 +149,16 @@ impl RendezvousServer {
+         log::info!("local-ip: {:?}", rs.inner.local_ip);
+         std::env::set_var("PORT_FOR_API", port.to_string());
+         rs.parse_relay_servers(&get_arg("relay-servers"));
++        let peer_map = rs.pm.clone();
++        tokio::spawn(async move {
++            loop {
++                let snapshot = peer_map.adm_snapshot().await;
++                for chunk in snapshot.chunks(200) {
++                    crate::adm::api("peers", serde_json::json!({"peers": chunk})).await;
++                }
++                tokio::time::sleep(Duration::from_secs(20)).await;
++            }
++        });
+         let mut listener = create_tcp_listener(port).await?;
+         let mut listener2 = create_tcp_listener(nat_port).await?;
+         let mut listener3 = create_tcp_listener(ws_port).await?;
+@@ -487,10 +499,12 @@ impl RendezvousServer {
+         addr: SocketAddr,
+         key: &str,
+         ws: bool,
++        secured: bool,
+     ) -> bool {
+         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+             match msg_in.union {
+                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
++                    if !secured { return false; }
+                     // there maybe several attempt, so sink can be none
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+@@ -499,12 +513,20 @@ impl RendezvousServer {
+                     return true;
+                 }
+                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
++                    if !secured { return false; }
++                    let peer = match self.pm.get_in_memory(&rf.id).await { Some(peer) => peer, None => return false };
++                    let target_ip = try_into_v4(peer.read().await.socket_addr).ip().to_string();
++                    if !crate::adm::api("authorize-connection", serde_json::json!({
++                        "destination_identity": self.pm.adm_peer(&rf.id).await, "token": rf.token, "destination_id": rf.id, "attempt_id": uuid::Uuid::new_v4().to_string(),
++                        "relay_uuid": rf.uuid, "source_ip": try_into_v4(addr).ip().to_string(), "destination_ip": target_ip,
++                    })).await { return false; }
+                     // there maybe several attempt, so sink can be none
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                     }
+                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                         let mut msg_out = RendezvousMessage::new();
++                        rf.token.clear();
+                         rf.socket_addr = AddrMangle::encode(addr).into();
+                         msg_out.set_request_relay(rf);
+                         let peer_addr = peer.read().await.socket_addr;
+@@ -514,6 +536,15 @@ impl RendezvousServer {
+                 }
+                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
+                     let addr_b = AddrMangle::decode(&rr.socket_addr);
++                    if !rr.uuid.is_empty() {
++                        let pending = PENDING_AUTHORIZATION.lock().await.remove(&try_into_v4(addr_b));
++                        let pending = match pending { Some(pending) => pending, None => return false };
++                        if pending.created.elapsed().as_secs() >= 30 || pending.target_ip != try_into_v4(addr).ip() || pending.destination != rr.id() { return false; }
++                        if !crate::adm::api("authorize-connection", serde_json::json!({
++                            "destination_identity": self.pm.adm_peer(&pending.destination).await, "token": pending.token, "destination_id": pending.destination, "attempt_id": uuid::Uuid::new_v4().to_string(),
++                            "relay_uuid": rr.uuid, "source_ip": try_into_v4(addr_b).ip().to_string(), "destination_ip": pending.target_ip.to_string(),
++                        })).await { return false; }
++                    }
+                     rr.socket_addr = Default::default();
+                     let id = rr.id();
+                     if !id.is_empty() {
+@@ -687,6 +718,11 @@ impl RendezvousServer {
+         ws: bool,
+     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+         let mut ph = ph;
++        if !crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await {
++            let mut denied = RendezvousMessage::new();
++            denied.set_punch_hole_response(PunchHoleResponse { failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(), ..Default::default() });
++            return Ok((denied, None));
++        }
+         if !key.is_empty() && ph.licence_key != key {
+             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+             let mut msg_out = RendezvousMessage::new();
+@@ -732,6 +768,11 @@ impl RendezvousServer {
+                 if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+             }
+ 
++            {
++                let mut pending = PENDING_AUTHORIZATION.lock().await;
++                pending.retain(|_, value| value.created.elapsed().as_secs() < 30);
++                pending.insert(try_into_v4(addr), PendingAuthorization { token: ph.token.clone(), destination: id.clone(), target_ip: try_into_v4(peer_addr).ip(), created: Instant::now() });
++            }
+             let mut msg_out = RendezvousMessage::new();
+             let peer_is_lan = self.is_lan(peer_addr);
+             let is_lan = self.is_lan(addr);
+@@ -743,7 +784,7 @@ impl RendezvousServer {
+                 }
+                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+             }
+-            let same_intranet: bool = !ws
++            let same_intranet: bool = !ALWAYS_USE_RELAY.load(Ordering::SeqCst) && !ws
+                 && (peer_is_lan && is_lan || {
+                     match (peer_addr, addr) {
+                         (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
+@@ -877,6 +918,9 @@ impl RendezvousServer {
+         ph: PunchHoleRequest,
+         key: &str,
+     ) -> ResultType<()> {
++        // Authenticated initiators must use the encrypted TCP handshake.
++        let mut ph = ph;
++        ph.token.clear();
+         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+         self.tx.send(Data::Msg(
+             msg.into(),
+@@ -1182,18 +1226,21 @@ impl RendezvousServer {
+             sink = Some(Sink::Ws(a));
+             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+                 if let tungstenite::Message::Binary(bytes) = msg {
+-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
++                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, false).await {
+                         break;
+                     }
+                 }
+             }
+         } else {
+-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
++            let signing = self.inner.sk.as_ref().ok_or_else(|| hbb_common::anyhow::anyhow!("Missing rendezvous signing key"))?;
++            let (framed, first, secured) = crate::adm::handshake(stream, signing).await?;
++            let (a, mut b) = framed.split();
+             sink = Some(Sink::TcpStream(a));
++            if let Some(bytes) = first {
++                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, secured).await { return Ok(()); }
++            }
+             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+-                    break;
+-                }
++                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, secured).await { break; }
+             }
+         }
+         if sink.is_none() {
+diff --git a/src/adm.rs b/src/adm.rs
+new file mode 100644
+index 0000000..7cb6d75
+--- /dev/null
++++ b/src/adm.rs
+@@ -0,0 +1,138 @@
++use hbb_common::{
++    bytes::{Bytes, BytesMut}, bytes_codec::BytesCodec,
++    futures_util::{SinkExt, StreamExt}, protobuf::Message,
++    rendezvous_proto::{rendezvous_message, KeyExchange, RendezvousMessage},
++    tcp::Encrypt, tokio::{net::TcpStream, time::{timeout, Duration}},
++    tokio_util::codec::{Decoder, Encoder, Framed}, ResultType,
++};
++use sodiumoxide::crypto::{box_, sign};
++use std::io;
++
++pub struct SecureCodec { framing: BytesCodec, encryption: Option<Encrypt> }
++impl SecureCodec {
++    fn new() -> Self {
++        let mut framing = BytesCodec::new();
++        framing.set_max_packet_length(1024 * 1024);
++        Self { framing, encryption: None }
++    }
++}
++impl Decoder for SecureCodec {
++    type Item = BytesMut;
++    type Error = io::Error;
++    fn decode(&mut self, src: &mut BytesMut) -> io::Result<Option<BytesMut>> {
++        let mut decoded = self.framing.decode(src)?;
++        if let (Some(bytes), Some(encryption)) = (&mut decoded, &mut self.encryption) {
++            if bytes.len() <= 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid encrypted packet")); }
++            encryption.dec(bytes)?;
++        }
++        Ok(decoded)
++    }
++}
++impl Encoder<Bytes> for SecureCodec {
++    type Error = io::Error;
++    fn encode(&mut self, data: Bytes, dst: &mut BytesMut) -> io::Result<()> {
++        let data = match &mut self.encryption {
++            Some(encryption) => Bytes::from(encryption.enc(&data)), None => data,
++        };
++        self.framing.encode(data, dst)
++    }
++}
++
++pub async fn handshake(stream: TcpStream, key: &sign::SecretKey) -> ResultType<(Framed<TcpStream, SecureCodec>, Option<BytesMut>, bool)> {
++    let mut framed = Framed::new(stream, SecureCodec::new());
++    // Receiver messages arrive first; an authenticated initiator waits for KeyExchange.
++    if let Ok(first) = timeout(Duration::from_millis(100), framed.next()).await {
++        return match first { Some(Ok(bytes)) => Ok((framed, Some(bytes), false)), _ => Err(hbb_common::anyhow::anyhow!("Closed before handshake")) };
++    }
++    let (public, secret) = box_::gen_keypair();
++    let mut hello = RendezvousMessage::new();
++    hello.set_key_exchange(KeyExchange { keys: vec![sign::sign(&public.0, key).into()], ..Default::default() });
++    framed.send(hello.write_to_bytes()?.into()).await?;
++    let bytes = timeout(Duration::from_secs(5), framed.next()).await?
++        .ok_or_else(|| hbb_common::anyhow::anyhow!("Closed during handshake"))??;
++    match RendezvousMessage::parse_from_bytes(&bytes)?.union {
++        Some(rendezvous_message::Union::KeyExchange(exchange)) if exchange.keys.len() == 2 => {
++            let symmetric = Encrypt::decode(&exchange.keys[1], &exchange.keys[0], &secret)?;
++            framed.codec_mut().encryption = Some(Encrypt::new(symmetric));
++            Ok((framed, None, true))
++        }
++        Some(rendezvous_message::Union::KeyExchange(_)) => Err(hbb_common::anyhow::anyhow!("Invalid key exchange")),
++        _ => Ok((framed, Some(bytes), false)),
++    }
++}
++
++pub async fn api(path: &str, body: serde_json::Value) -> bool {
++    let base = std::env::var("RUSTDESK_ADM_API").unwrap_or_default();
++    let secret = std::env::var("RUSTDESK_ADM_SECRET").unwrap_or_default();
++    if !base.starts_with("https://") || secret.len() < 32 { return false; }
++    let client = match reqwest::Client::builder().user_agent("RustDesk-ADM/1.0").redirect(reqwest::redirect::Policy::none())
++        .connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(4)).build() {
++        Ok(client) => client, Err(_) => return false,
++    };
++    match client.post(format!("{}/api/internal/rustdesk/v1/{}", base.trim_end_matches('/'), path))
++        .header("X-RustDesk-Server-Secret", secret).json(&body).send().await {
++        Ok(response) if response.status().is_success() => response.json::<serde_json::Value>().await
++            .ok().and_then(|value| value.get("allow").and_then(|v| v.as_bool())).unwrap_or(false),
++        _ => false,
++    }
++}
++
++pub async fn authorize(token: &str, destination: &str, identity: Option<serde_json::Value>) -> bool {
++    if token.is_empty() || identity.is_none() { return false; }
++    api("authorize-connection", serde_json::json!({"token": token, "destination_id": destination, "destination_identity": identity, "attempt_id": uuid::Uuid::new_v4().to_string()})).await
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use hbb_common::{tcp::FramedStream, tokio::net::TcpListener};
++    use sodiumoxide::crypto::secretbox;
++
++    #[hbb_common::tokio::test(crate = "hbb_common::tokio")]
++    async fn official_key_exchange_encrypts_both_directions() {
++        sodiumoxide::init().unwrap();
++        let (signing_public, signing_secret) = sign::gen_keypair();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = listener.local_addr().unwrap();
++        let server = hbb_common::tokio::spawn(async move {
++            let (socket, _) = listener.accept().await.unwrap();
++            let (mut framed, first, secured) = handshake(socket, &signing_secret).await.unwrap();
++            assert!(secured && first.is_none());
++            let received = framed.next().await.unwrap().unwrap();
++            let request = RendezvousMessage::parse_from_bytes(&received).unwrap();
++            assert_eq!(request.punch_hole_request().token, "test-token");
++            framed.send(received.freeze()).await.unwrap();
++        });
++        let mut client = FramedStream::from(TcpStream::connect(address).await.unwrap(), address);
++        let hello = client.next_timeout(5000).await.unwrap().unwrap();
++        let hello = RendezvousMessage::parse_from_bytes(&hello).unwrap();
++        let public = sign::verify(&hello.key_exchange().keys[0], &signing_public).unwrap();
++        let public = box_::PublicKey::from_slice(&public).unwrap();
++        let (client_public, client_secret) = box_::gen_keypair();
++        let symmetric = secretbox::gen_key();
++        let encrypted = box_::seal(&symmetric.0, &box_::Nonce([0; box_::NONCEBYTES]), &public, &client_secret);
++        let mut exchange = RendezvousMessage::new();
++        exchange.set_key_exchange(KeyExchange { keys: vec![client_public.0.to_vec().into(), encrypted.into()], ..Default::default() });
++        client.send(&exchange).await.unwrap();
++        client.set_key(symmetric);
++        let mut request = RendezvousMessage::new();
++        request.set_punch_hole_request(hbb_common::rendezvous_proto::PunchHoleRequest { id: "123456789".into(), token: "test-token".into(), ..Default::default() });
++        client.send(&request).await.unwrap();
++        let echoed = client.next_timeout(5000).await.unwrap().unwrap();
++        assert_eq!(RendezvousMessage::parse_from_bytes(&echoed).unwrap().punch_hole_request().token, "test-token");
++        server.await.unwrap();
++    }
++
++    #[hbb_common::tokio::test(crate = "hbb_common::tokio")]
++    async fn legacy_receiver_message_is_not_authenticated() {
++        let (_, signing_secret) = sign::gen_keypair();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = listener.local_addr().unwrap();
++        let mut client = FramedStream::from(TcpStream::connect(address).await.unwrap(), address);
++        let request = RendezvousMessage::new();
++        client.send(&request).await.unwrap();
++        let (socket, _) = listener.accept().await.unwrap();
++        let (_, first, secured) = handshake(socket, &signing_secret).await.unwrap();
++        assert!(!secured && first.is_some());
++    }
++}

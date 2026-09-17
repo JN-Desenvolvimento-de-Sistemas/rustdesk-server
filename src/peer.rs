@@ -66,6 +66,26 @@ pub(crate) struct PeerMap {
 }
 
 impl PeerMap {
+    pub(crate) async fn adm_peer(&self, id: &str) -> Option<serde_json::Value> {
+        let peer = self.get_in_memory(id).await?;
+        let peer = peer.read().await;
+        if peer.pk.is_empty() || peer.uuid.is_empty() || peer.last_reg_time.elapsed().as_secs() > 60 { return None; }
+        let fingerprint: String = sodiumoxide::crypto::hash::sha256::hash(&peer.pk).0.iter().map(|byte| format!("{:02x}", byte)).collect();
+        Some(serde_json::json!({"uuid": base64::encode(&peer.uuid), "fingerprint": fingerprint}))
+    }
+
+    pub(crate) async fn adm_snapshot(&self) -> Vec<serde_json::Value> {
+        let peers: Vec<_> = self.map.read().await.iter().map(|(id, peer)| (id.clone(), peer.clone())).collect();
+        let mut result = Vec::new();
+        for (id, peer) in peers {
+            let peer = peer.read().await;
+            if peer.pk.is_empty() || peer.uuid.is_empty() || peer.last_reg_time.elapsed().as_secs() > 60 { continue; }
+            let fingerprint: String = sodiumoxide::crypto::hash::sha256::hash(&peer.pk).0.iter().map(|byte| format!("{:02x}", byte)).collect();
+            result.push(serde_json::json!({"id": id, "uuid": base64::encode(&peer.uuid), "fingerprint": fingerprint, "seen_seconds_ago": peer.last_reg_time.elapsed().as_secs().min(86400)}));
+        }
+        result
+    }
+
     pub(crate) async fn new() -> ResultType<Self> {
         let db = std::env::var("DB_URL").unwrap_or({
             let mut db = "db_v2.sqlite3".to_owned();

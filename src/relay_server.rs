@@ -392,29 +392,13 @@ async fn handle_connection(
 
 async fn make_pair(
     stream: TcpStream,
-    mut addr: SocketAddr,
+    addr: SocketAddr,
     key: &str,
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
     if ws {
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-        let callback = |req: &Request, response: Response| {
-            let headers = req.headers();
-            let real_ip = headers
-                .get("X-Real-IP")
-                .or_else(|| headers.get("X-Forwarded-For"))
-                .and_then(|header_value| header_value.to_str().ok());
-            if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                }
-            }
-            Ok(response)
-        };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
@@ -432,8 +416,20 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     return;
                 }
                 if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
+                    if uuid::Uuid::parse_str(&rf.uuid).is_err() { return; }
+                    let mut admitted = false;
+                    for _ in 0..10 {
+                        if crate::adm::api(&format!("relay/{}/claim", rf.uuid), serde_json::json!({"ip": hbb_common::try_into_v4(addr).ip().to_string()})).await {
+                            admitted = true; break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    if !admitted { return; }
+                    let mut peers = PEERS.lock().await;
+                    let mut paired_stream = peers.remove(&rf.uuid);
+                    if let Some(peer_stream) = paired_stream.as_mut() {
+                        drop(peers);
+                        let peer = peer_stream;
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -442,7 +438,19 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                             stream.set_raw();
                             log::info!("Both are raw");
                         }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
+                        let result = tokio::select! {
+                            result = relay(addr, &mut stream, peer, limiter, id.clone()) => result,
+                            _ = async {
+                                loop {
+                                    if !crate::adm::api(&format!("relay/{}/status", rf.uuid), serde_json::json!({})).await { break; }
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
+                            } => Err(hbb_common::anyhow::anyhow!("Session authorization revoked or unavailable")),
+                        };
+                        drop(stream);
+                        drop(paired_stream);
+                        crate::adm::api(&format!("relay/{}/close", rf.uuid), serde_json::json!({})).await;
+                        if let Err(err) = result
                         {
                             log::info!("Relay of {} closed: {}", addr, err);
                         } else {
@@ -451,7 +459,8 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                         USAGE.write().await.remove(&id);
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+                        peers.insert(rf.uuid.clone(), Box::new(stream));
+                        drop(peers);
                         sleep(30.).await;
                         PEERS.lock().await.remove(&rf.uuid);
                     }

@@ -1,0 +1,6 @@
+.git
+target
+.env.*
+!.env.example
+*.log
+id_ed25519*

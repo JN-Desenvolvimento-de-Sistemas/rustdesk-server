@@ -1,3 +1,4 @@
+mod adm;
 use clap::App;
 mod common;
 mod relay_server;

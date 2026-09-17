@@ -719,9 +719,7 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await {
-            let mut denied = RendezvousMessage::new();
-            denied.set_punch_hole_response(PunchHoleResponse { failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(), ..Default::default() });
-            return Ok((denied, None));
+            return Ok((crate::adm::access_denied_response(), None));
         }
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);

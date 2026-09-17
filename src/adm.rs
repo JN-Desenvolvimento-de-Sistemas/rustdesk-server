@@ -82,6 +82,15 @@ pub async fn authorize(token: &str, destination: &str, identity: Option<serde_js
     api("authorize-connection", serde_json::json!({"token": token, "destination_id": destination, "destination_identity": identity, "attempt_id": uuid::Uuid::new_v4().to_string()})).await
 }
 
+pub fn access_denied_response() -> RendezvousMessage {
+    let mut response = RendezvousMessage::new();
+    response.set_punch_hole_response(hbb_common::rendezvous_proto::PunchHoleResponse {
+        other_failure: "Você não possui permissão para acessar esse dispositivo. Entre em contato com o administrador".into(),
+        ..Default::default()
+    });
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +111,9 @@ mod tests {
             let request = RendezvousMessage::parse_from_bytes(&received).unwrap();
             assert_eq!(request.punch_hole_request().token, "test-token");
             framed.send(received.freeze()).await.unwrap();
+            let received = framed.next().await.unwrap().unwrap();
+            assert!(RendezvousMessage::parse_from_bytes(&received).unwrap().has_punch_hole_request());
+            framed.send(access_denied_response().write_to_bytes().unwrap().into()).await.unwrap();
         });
         let mut client = FramedStream::from(TcpStream::connect(address).await.unwrap(), address);
         let hello = client.next_timeout(5000).await.unwrap().unwrap();
@@ -120,6 +132,13 @@ mod tests {
         client.send(&request).await.unwrap();
         let echoed = client.next_timeout(5000).await.unwrap().unwrap();
         assert_eq!(RendezvousMessage::parse_from_bytes(&echoed).unwrap().punch_hole_request().token, "test-token");
+        client.send(&request).await.unwrap();
+        let denied = client.next_timeout(5000).await.unwrap().unwrap();
+        let denied = RendezvousMessage::parse_from_bytes(&denied).unwrap();
+        assert!(denied.has_punch_hole_response());
+        assert!(denied.punch_hole_response().socket_addr.is_empty());
+        assert_eq!(denied.punch_hole_response().other_failure,
+            "Você não possui permissão para acessar esse dispositivo. Entre em contato com o administrador");
         server.await.unwrap();
     }
 

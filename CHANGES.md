@@ -36,3 +36,11 @@ Alterações de 2026-09-17:
 - Testes de respostas HTTP, timeout, transporte, mensagens criptografadas, UDP e presença antiga. O build agora executa todos os testes da biblioteca.
 
 Validação desta versão: nove testes da biblioteca aprovados; registro UDP e respostas criptografadas de indisponibilidade para PunchHoleRequest e RequestRelay confirmados com o binário compilado em ambiente isolado. Imagem publicada: `sha256:99435df34a0290c75137b2d43561c5e42264ce2045958e99667ed8f9eec7a9ea`.
+
+## jn-2026.10.08.1 — resposta de dispositivo offline
+
+Alteração de 2026-10-08 em `src/rendezvous_server.rs`: a verificação de presença passa a ocorrer antes da consulta de autorização. Dispositivos offline recebem a resposta nativa `OFFLINE`, inclusive após reinício do servidor; IDs desconhecidos recebem `ID_NOT_EXIST`. Pedidos sem token continuam bloqueados, e destinos online continuam exigindo autorização antes de qualquer encaminhamento. O cliente oficial permanece sem alterações.
+
+Testes de regressão cobrem presença expirada, dispositivos persistidos sem registro ativo, IDs desconhecidos, ausência de token, identidade ausente e chave de servidor incorreta.
+
+Validação desta versão: 14 testes da biblioteca aprovados, imagem Linux amd64 compilada e execução dos dois binários confirmada. Imagem publicada: `sha256:1bdfa81f3658f02927753a851ad8068bd570ecd45cb7b9a605c83b7a6c16dd8a`.

@@ -716,8 +716,8 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
-        if let Some(response) = crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await.punch_response() {
-            return Ok((response, None));
+        if ph.token.is_empty() {
+            return Ok((crate::adm::Authorization::Denied.punch_response().unwrap(), None));
         }
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -747,7 +747,12 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
-            
+            // Offline and unknown peers use the native failure response. Online
+            // peers still require authorization before any address is forwarded.
+            if let Some(response) = crate::adm::authorize(&ph.token, &id, self.pm.adm_peer(&id).await).await.punch_response() {
+                return Ok((response, None));
+            }
+
             // record punch hole request (from addr -> peer id/peer_addr)
             {
                 let from_ip = try_into_v4(addr).ip().to_string();
@@ -1467,6 +1472,89 @@ mod regression_tests {
         let response = client.next_timeout(2000).await.unwrap().unwrap();
         let response = RendezvousMessage::parse_from_bytes(&response).unwrap();
         assert_eq!(response.online_response().states.as_ref(), &[0b1000_0000]);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_destination_returns_native_offline_without_forwarding() {
+        let (mut server, path) = fixture().await;
+        let id = "123456789";
+        let peer = server.pm.get_or(id).await;
+        for seconds in [30, 61, 30 * 86400] {
+            peer.write().await.last_reg_time = Instant::now() - Duration::from_secs(seconds);
+            for ws in [false, true] {
+                let request = PunchHoleRequest { id: id.into(), token: "test-token".into(), ..Default::default() };
+                let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40000".parse().unwrap(), request, "", ws).await.unwrap();
+                assert!(destination.is_none());
+                assert!(response.punch_hole_response().socket_addr.is_empty());
+                assert!(response.punch_hole_response().other_failure.is_empty());
+                assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::OFFLINE);
+            }
+        }
+        drop(peer);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_destination_keeps_native_not_found_response() {
+        let (mut server, path) = fixture().await;
+        let request = PunchHoleRequest { id: "unknown".into(), token: "test-token".into(), ..Default::default() };
+        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40001".parse().unwrap(), request, "", false).await.unwrap();
+        assert!(destination.is_none());
+        assert!(response.punch_hole_response().socket_addr.is_empty());
+        assert!(response.punch_hole_response().other_failure.is_empty());
+        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::ID_NOT_EXIST);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_destination_without_live_registration_is_offline() {
+        let (mut server, path) = fixture().await;
+        server.pm.db.insert_peer("123456789", b"test-uuid", b"test-key", "{}").await.unwrap();
+        assert!(server.pm.get_in_memory("123456789").await.is_none());
+        let request = PunchHoleRequest { id: "123456789".into(), token: "test-token".into(), ..Default::default() };
+        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40004".parse().unwrap(), request, "", false).await.unwrap();
+        assert!(destination.is_none());
+        assert!(response.punch_hole_response().socket_addr.is_empty());
+        assert!(response.punch_hole_response().other_failure.is_empty());
+        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::OFFLINE);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_login_never_forwards_even_to_an_online_destination() {
+        let (mut server, path) = fixture().await;
+        let peer = server.pm.get_or("123456789").await;
+        peer.write().await.last_reg_time = Instant::now();
+        for id in ["123456789", "unknown"] {
+            let request = PunchHoleRequest { id: id.into(), ..Default::default() };
+            let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40002".parse().unwrap(), request, "", false).await.unwrap();
+            assert!(destination.is_none());
+            assert!(response.punch_hole_response().socket_addr.is_empty());
+            assert_eq!(response.punch_hole_response().other_failure, crate::adm::Authorization::Denied.message().unwrap());
+        }
+        drop(peer);
+        drop(server);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn online_destination_still_requires_authorization_and_server_key() {
+        let (mut server, path) = fixture().await;
+        let peer = server.pm.get_or("123456789").await;
+        peer.write().await.last_reg_time = Instant::now();
+        let request = PunchHoleRequest { id: "123456789".into(), token: "test-token".into(), ..Default::default() };
+        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40003".parse().unwrap(), request.clone(), "", false).await.unwrap();
+        assert!(destination.is_none());
+        assert_eq!(response.punch_hole_response().other_failure, crate::adm::Authorization::Denied.message().unwrap());
+        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40003".parse().unwrap(), request, "server-key", false).await.unwrap();
+        assert!(destination.is_none());
+        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::LICENSE_MISMATCH);
+        drop(peer);
         drop(server);
         std::fs::remove_file(path).unwrap();
     }

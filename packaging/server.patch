@@ -458,7 +458,7 @@ index 0ec190a..cd22ddc 100644
                          PEERS.lock().await.remove(&rf.uuid);
                      }
 diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
-index dff45eb..6aec273 100644
+index dff45eb..b2b3a68 100644
 --- a/src/rendezvous_server.rs
 +++ b/src/rendezvous_server.rs
 @@ -3,7 +3,6 @@ use crate::peer::*;
@@ -572,13 +572,27 @@ index dff45eb..6aec273 100644
          ws: bool,
      ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
          let mut ph = ph;
-+        if let Some(response) = crate::adm::authorize(&ph.token, &ph.id, self.pm.adm_peer(&ph.id).await).await.punch_response() {
-+            return Ok((response, None));
++        if ph.token.is_empty() {
++            return Ok((crate::adm::Authorization::Denied.punch_response().unwrap(), None));
 +        }
          if !key.is_empty() && ph.licence_key != key {
              log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
              let mut msg_out = RendezvousMessage::new();
-@@ -724,6 +764,11 @@ impl RendezvousServer {
+@@ -707,7 +747,12 @@ impl RendezvousServer {
+                 });
+                 return Ok((msg_out, None));
+             }
+-            
++            // Offline and unknown peers use the native failure response. Online
++            // peers still require authorization before any address is forwarded.
++            if let Some(response) = crate::adm::authorize(&ph.token, &id, self.pm.adm_peer(&id).await).await.punch_response() {
++                return Ok((response, None));
++            }
++
+             // record punch hole request (from addr -> peer id/peer_addr)
+             {
+                 let from_ip = try_into_v4(addr).ip().to_string();
+@@ -724,6 +769,11 @@ impl RendezvousServer {
                  if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
              }
  
@@ -590,7 +604,7 @@ index dff45eb..6aec273 100644
              let mut msg_out = RendezvousMessage::new();
              let peer_is_lan = self.is_lan(peer_addr);
              let is_lan = self.is_lan(addr);
-@@ -735,7 +780,7 @@ impl RendezvousServer {
+@@ -735,7 +785,7 @@ impl RendezvousServer {
                  }
                  ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
              }
@@ -599,7 +613,7 @@ index dff45eb..6aec273 100644
                  && (peer_is_lan && is_lan || {
                      match (peer_addr, addr) {
                          (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-@@ -869,6 +914,9 @@ impl RendezvousServer {
+@@ -869,6 +919,9 @@ impl RendezvousServer {
          ph: PunchHoleRequest,
          key: &str,
      ) -> ResultType<()> {
@@ -609,7 +623,7 @@ index dff45eb..6aec273 100644
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
          self.tx.send(Data::Msg(
              msg.into(),
-@@ -1171,18 +1219,21 @@ impl RendezvousServer {
+@@ -1171,18 +1224,21 @@ impl RendezvousServer {
              sink = Some(Sink::Ws(a));
              while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                  if let tungstenite::Message::Binary(bytes) = msg {
@@ -636,7 +650,7 @@ index dff45eb..6aec273 100644
              }
          }
          if sink.is_none() {
-@@ -1361,3 +1412,62 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
+@@ -1361,3 +1417,145 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
      log::debug!("listen on tcp {:?}", s.local_addr());
      Ok(s)
  }
@@ -695,6 +709,89 @@ index dff45eb..6aec273 100644
 +        let response = client.next_timeout(2000).await.unwrap().unwrap();
 +        let response = RendezvousMessage::parse_from_bytes(&response).unwrap();
 +        assert_eq!(response.online_response().states.as_ref(), &[0b1000_0000]);
++        drop(server);
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[tokio::test]
++    async fn offline_destination_returns_native_offline_without_forwarding() {
++        let (mut server, path) = fixture().await;
++        let id = "123456789";
++        let peer = server.pm.get_or(id).await;
++        for seconds in [30, 61, 30 * 86400] {
++            peer.write().await.last_reg_time = Instant::now() - Duration::from_secs(seconds);
++            for ws in [false, true] {
++                let request = PunchHoleRequest { id: id.into(), token: "test-token".into(), ..Default::default() };
++                let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40000".parse().unwrap(), request, "", ws).await.unwrap();
++                assert!(destination.is_none());
++                assert!(response.punch_hole_response().socket_addr.is_empty());
++                assert!(response.punch_hole_response().other_failure.is_empty());
++                assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::OFFLINE);
++            }
++        }
++        drop(peer);
++        drop(server);
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[tokio::test]
++    async fn unknown_destination_keeps_native_not_found_response() {
++        let (mut server, path) = fixture().await;
++        let request = PunchHoleRequest { id: "unknown".into(), token: "test-token".into(), ..Default::default() };
++        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40001".parse().unwrap(), request, "", false).await.unwrap();
++        assert!(destination.is_none());
++        assert!(response.punch_hole_response().socket_addr.is_empty());
++        assert!(response.punch_hole_response().other_failure.is_empty());
++        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::ID_NOT_EXIST);
++        drop(server);
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[tokio::test]
++    async fn persisted_destination_without_live_registration_is_offline() {
++        let (mut server, path) = fixture().await;
++        server.pm.db.insert_peer("123456789", b"test-uuid", b"test-key", "{}").await.unwrap();
++        assert!(server.pm.get_in_memory("123456789").await.is_none());
++        let request = PunchHoleRequest { id: "123456789".into(), token: "test-token".into(), ..Default::default() };
++        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40004".parse().unwrap(), request, "", false).await.unwrap();
++        assert!(destination.is_none());
++        assert!(response.punch_hole_response().socket_addr.is_empty());
++        assert!(response.punch_hole_response().other_failure.is_empty());
++        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::OFFLINE);
++        drop(server);
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[tokio::test]
++    async fn missing_login_never_forwards_even_to_an_online_destination() {
++        let (mut server, path) = fixture().await;
++        let peer = server.pm.get_or("123456789").await;
++        peer.write().await.last_reg_time = Instant::now();
++        for id in ["123456789", "unknown"] {
++            let request = PunchHoleRequest { id: id.into(), ..Default::default() };
++            let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40002".parse().unwrap(), request, "", false).await.unwrap();
++            assert!(destination.is_none());
++            assert!(response.punch_hole_response().socket_addr.is_empty());
++            assert_eq!(response.punch_hole_response().other_failure, crate::adm::Authorization::Denied.message().unwrap());
++        }
++        drop(peer);
++        drop(server);
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[tokio::test]
++    async fn online_destination_still_requires_authorization_and_server_key() {
++        let (mut server, path) = fixture().await;
++        let peer = server.pm.get_or("123456789").await;
++        peer.write().await.last_reg_time = Instant::now();
++        let request = PunchHoleRequest { id: "123456789".into(), token: "test-token".into(), ..Default::default() };
++        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40003".parse().unwrap(), request.clone(), "", false).await.unwrap();
++        assert!(destination.is_none());
++        assert_eq!(response.punch_hole_response().other_failure, crate::adm::Authorization::Denied.message().unwrap());
++        let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40003".parse().unwrap(), request, "server-key", false).await.unwrap();
++        assert!(destination.is_none());
++        assert_eq!(response.punch_hole_response().failure.enum_value().unwrap(), punch_hole_response::Failure::LICENSE_MISMATCH);
++        drop(peer);
 +        drop(server);
 +        std::fs::remove_file(path).unwrap();
 +    }

@@ -1,9 +1,9 @@
 diff --git a/src/adm.rs b/src/adm.rs
 new file mode 100644
-index 0000000..af3bd66
+index 0000000..a853bcb
 --- /dev/null
 +++ b/src/adm.rs
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,317 @@
 +use hbb_common::{
 +    bytes::{Bytes, BytesMut}, bytes_codec::BytesCodec,
 +    futures_util::{SinkExt, StreamExt}, protobuf::Message,
@@ -81,6 +81,7 @@ index 0000000..af3bd66
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub enum Authorization {
 +    Allowed,
++    LoginRequired,
 +    Denied,
 +    Unavailable(ApiFailure),
 +}
@@ -89,6 +90,7 @@ index 0000000..af3bd66
 +    pub fn message(self) -> Option<&'static str> {
 +        match self {
 +            Self::Allowed => None,
++            Self::LoginRequired => Some("Você precisa entrar na sua conta do RustDesk para acessar este dispositivo"),
 +            Self::Denied => Some("Você não possui permissão para acessar esse dispositivo. Entre em contato com o administrador"),
 +            Self::Unavailable(_) => Some("Serviço temporariamente indisponível. Tente novamente em instantes"),
 +        }
@@ -170,7 +172,8 @@ index 0000000..af3bd66
 +}
 +
 +pub async fn authorize(token: &str, destination: &str, identity: Option<serde_json::Value>) -> Authorization {
-+    if token.is_empty() || identity.is_none() { return Authorization::Denied; }
++    if token.is_empty() { return Authorization::LoginRequired; }
++    if identity.is_none() { return Authorization::Denied; }
 +    connection_authorization(serde_json::json!({"token": token, "destination_id": destination, "destination_identity": identity, "attempt_id": uuid::Uuid::new_v4().to_string()})).await
 +}
 +
@@ -194,7 +197,7 @@ index 0000000..af3bd66
 +            let request = RendezvousMessage::parse_from_bytes(&received).unwrap();
 +            assert_eq!(request.punch_hole_request().token, "test-token");
 +            framed.send(received.freeze()).await.unwrap();
-+            for decision in [Authorization::Denied, Authorization::Unavailable(ApiFailure::Timeout)] {
++            for decision in [Authorization::LoginRequired, Authorization::Denied, Authorization::Unavailable(ApiFailure::Timeout)] {
 +                let received = framed.next().await.unwrap().unwrap();
 +                assert!(RendezvousMessage::parse_from_bytes(&received).unwrap().has_punch_hole_request());
 +                framed.send(decision.punch_response().unwrap().write_to_bytes().unwrap().into()).await.unwrap();
@@ -217,6 +220,12 @@ index 0000000..af3bd66
 +        client.send(&request).await.unwrap();
 +        let echoed = client.next_timeout(5000).await.unwrap().unwrap();
 +        assert_eq!(RendezvousMessage::parse_from_bytes(&echoed).unwrap().punch_hole_request().token, "test-token");
++        client.send(&request).await.unwrap();
++        let login_required = client.next_timeout(5000).await.unwrap().unwrap();
++        let login_required = RendezvousMessage::parse_from_bytes(&login_required).unwrap();
++        assert!(login_required.punch_hole_response().socket_addr.is_empty());
++        assert_eq!(login_required.punch_hole_response().other_failure,
++            "Você precisa entrar na sua conta do RustDesk para acessar este dispositivo");
 +        client.send(&request).await.unwrap();
 +        let denied = client.next_timeout(5000).await.unwrap().unwrap();
 +        let denied = RendezvousMessage::parse_from_bytes(&denied).unwrap();
@@ -300,7 +309,7 @@ index 0000000..af3bd66
 +        assert!(configured_base("https://api.example.org", &"a".repeat(32)).is_ok());
 +        assert!(Authorization::Allowed.punch_response().is_none());
 +        assert!(Authorization::Allowed.relay_response().is_none());
-+        for decision in [Authorization::Denied, Authorization::Unavailable(ApiFailure::Configuration), Authorization::Unavailable(ApiFailure::Timeout)] {
++        for decision in [Authorization::LoginRequired, Authorization::Denied, Authorization::Unavailable(ApiFailure::Configuration), Authorization::Unavailable(ApiFailure::Timeout)] {
 +            let punch = decision.punch_response().unwrap();
 +            assert!(punch.punch_hole_response().socket_addr.is_empty());
 +            assert_eq!(punch.punch_hole_response().other_failure, decision.message().unwrap());
@@ -458,7 +467,7 @@ index 0ec190a..cd22ddc 100644
                          PEERS.lock().await.remove(&rf.uuid);
                      }
 diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
-index dff45eb..b2b3a68 100644
+index dff45eb..0283f39 100644
 --- a/src/rendezvous_server.rs
 +++ b/src/rendezvous_server.rs
 @@ -3,7 +3,6 @@ use crate::peer::*;
@@ -512,7 +521,7 @@ index dff45eb..b2b3a68 100644
                  }
                  Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                      if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
-@@ -479,10 +491,12 @@ impl RendezvousServer {
+@@ -479,10 +491,15 @@ impl RendezvousServer {
          addr: SocketAddr,
          key: &str,
          ws: bool,
@@ -521,15 +530,21 @@ index dff45eb..b2b3a68 100644
          if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
              match msg_in.union {
                  Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-+                    if !secured { return false; }
++                    if !secured {
++                        Self::send_to_sink(sink, crate::adm::Authorization::LoginRequired.punch_response().unwrap()).await;
++                        return false;
++                    }
                      // there maybe several attempt, so sink can be none
                      if let Some(sink) = sink.take() {
                          self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
-@@ -491,12 +505,23 @@ impl RendezvousServer {
+@@ -491,12 +508,26 @@ impl RendezvousServer {
                      return true;
                  }
                  Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
-+                    if !secured { return false; }
++                    if !secured {
++                        Self::send_to_sink(sink, crate::adm::Authorization::LoginRequired.relay_response().unwrap()).await;
++                        return false;
++                    }
 +                    let peer = match self.pm.get_in_memory(&rf.id).await { Some(peer) => peer, None => return false };
 +                    let target_ip = try_into_v4(peer.read().await.socket_addr).ip().to_string();
 +                    if let Some(response) = crate::adm::connection_authorization(serde_json::json!({
@@ -549,7 +564,7 @@ index dff45eb..b2b3a68 100644
                          rf.socket_addr = AddrMangle::encode(addr).into();
                          msg_out.set_request_relay(rf);
                          let peer_addr = peer.read().await.socket_addr;
-@@ -506,6 +531,18 @@ impl RendezvousServer {
+@@ -506,6 +537,18 @@ impl RendezvousServer {
                  }
                  Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                      let addr_b = AddrMangle::decode(&rr.socket_addr);
@@ -568,17 +583,17 @@ index dff45eb..b2b3a68 100644
                      rr.socket_addr = Default::default();
                      let id = rr.id();
                      if !id.is_empty() {
-@@ -679,6 +716,9 @@ impl RendezvousServer {
+@@ -679,6 +722,9 @@ impl RendezvousServer {
          ws: bool,
      ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
          let mut ph = ph;
 +        if ph.token.is_empty() {
-+            return Ok((crate::adm::Authorization::Denied.punch_response().unwrap(), None));
++            return Ok((crate::adm::Authorization::LoginRequired.punch_response().unwrap(), None));
 +        }
          if !key.is_empty() && ph.licence_key != key {
              log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
              let mut msg_out = RendezvousMessage::new();
-@@ -707,7 +747,12 @@ impl RendezvousServer {
+@@ -707,7 +753,12 @@ impl RendezvousServer {
                  });
                  return Ok((msg_out, None));
              }
@@ -592,7 +607,7 @@ index dff45eb..b2b3a68 100644
              // record punch hole request (from addr -> peer id/peer_addr)
              {
                  let from_ip = try_into_v4(addr).ip().to_string();
-@@ -724,6 +769,11 @@ impl RendezvousServer {
+@@ -724,6 +775,11 @@ impl RendezvousServer {
                  if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
              }
  
@@ -604,7 +619,7 @@ index dff45eb..b2b3a68 100644
              let mut msg_out = RendezvousMessage::new();
              let peer_is_lan = self.is_lan(peer_addr);
              let is_lan = self.is_lan(addr);
-@@ -735,7 +785,7 @@ impl RendezvousServer {
+@@ -735,7 +791,7 @@ impl RendezvousServer {
                  }
                  ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
              }
@@ -613,7 +628,7 @@ index dff45eb..b2b3a68 100644
                  && (peer_is_lan && is_lan || {
                      match (peer_addr, addr) {
                          (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-@@ -869,6 +919,9 @@ impl RendezvousServer {
+@@ -869,6 +925,9 @@ impl RendezvousServer {
          ph: PunchHoleRequest,
          key: &str,
      ) -> ResultType<()> {
@@ -623,7 +638,7 @@ index dff45eb..b2b3a68 100644
          let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
          self.tx.send(Data::Msg(
              msg.into(),
-@@ -1171,18 +1224,21 @@ impl RendezvousServer {
+@@ -1171,18 +1230,21 @@ impl RendezvousServer {
              sink = Some(Sink::Ws(a));
              while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                  if let tungstenite::Message::Binary(bytes) = msg {
@@ -650,7 +665,7 @@ index dff45eb..b2b3a68 100644
              }
          }
          if sink.is_none() {
-@@ -1361,3 +1417,145 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
+@@ -1361,3 +1423,209 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
      log::debug!("listen on tcp {:?}", s.local_addr());
      Ok(s)
  }
@@ -772,11 +787,75 @@ index dff45eb..b2b3a68 100644
 +            let (response, destination) = server.handle_punch_hole_request("127.0.0.1:40002".parse().unwrap(), request, "", false).await.unwrap();
 +            assert!(destination.is_none());
 +            assert!(response.punch_hole_response().socket_addr.is_empty());
-+            assert_eq!(response.punch_hole_response().other_failure, crate::adm::Authorization::Denied.message().unwrap());
++            assert_eq!(response.punch_hole_response().other_failure,
++                "Você precisa entrar na sua conta do RustDesk para acessar este dispositivo");
 +        }
 +        drop(peer);
 +        drop(server);
 +        std::fs::remove_file(path).unwrap();
++    }
++
++    async fn unauthenticated_tcp_response(request: RendezvousMessage, wait_for_exchange: bool) -> RendezvousMessage {
++        sodiumoxide::init().unwrap();
++        let (mut server, path) = fixture().await;
++        let (_, signing_secret) = sign::gen_keypair();
++        Arc::get_mut(&mut server.inner).unwrap().sk = Some(signing_secret);
++        server.pm.get_or("123456789").await.write().await.last_reg_time = Instant::now();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = listener.local_addr().unwrap();
++        let mut client = FramedStream::from(TcpStream::connect(address).await.unwrap(), address);
++        if !wait_for_exchange {
++            client.send(&request).await.unwrap();
++        }
++        let (socket, address) = listener.accept().await.unwrap();
++        let handler = tokio::spawn(async move {
++            server.handle_listener_inner(socket, address, "", false).await.unwrap();
++            assert!(server.tcp_punch.lock().await.is_empty());
++            assert!(server.pm.get_in_memory("unknown").await.is_none());
++            drop(server);
++            std::fs::remove_file(path).unwrap();
++        });
++        if wait_for_exchange {
++            let hello = client.next_timeout(5000).await.unwrap().unwrap();
++            assert!(RendezvousMessage::parse_from_bytes(&hello).unwrap().has_key_exchange());
++            client.send(&request).await.unwrap();
++        }
++        let response = client.next_timeout(5000).await.unwrap().unwrap();
++        assert!(tokio::time::timeout(Duration::from_secs(5), client.next()).await.unwrap().is_none());
++        handler.await.unwrap();
++        RendezvousMessage::parse_from_bytes(&response).unwrap()
++    }
++
++    #[tokio::test]
++    async fn unauthenticated_tcp_punch_returns_login_message_before_closing() {
++        for wait_for_exchange in [false, true] {
++            for (id, token) in [("123456789", ""), ("unknown", ""), ("123456789", "untrusted-token")] {
++                let mut request = RendezvousMessage::new();
++                request.set_punch_hole_request(PunchHoleRequest { id: id.into(), token: token.into(), ..Default::default() });
++                let response = unauthenticated_tcp_response(request, wait_for_exchange).await;
++                assert!(response.has_punch_hole_response());
++                assert!(response.punch_hole_response().socket_addr.is_empty());
++                assert!(response.punch_hole_response().pk.is_empty());
++                assert_eq!(response.punch_hole_response().other_failure,
++                    "Você precisa entrar na sua conta do RustDesk para acessar este dispositivo");
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn unauthenticated_tcp_relay_returns_login_message_before_closing() {
++        for wait_for_exchange in [false, true] {
++            for token in ["", "untrusted-token"] {
++                let mut request = RendezvousMessage::new();
++                request.set_request_relay(RequestRelay { id: "123456789".into(), token: token.into(), uuid: "untrusted-relay".into(), ..Default::default() });
++                let response = unauthenticated_tcp_response(request, wait_for_exchange).await;
++                assert!(response.has_relay_response());
++                assert!(response.relay_response().socket_addr.is_empty());
++                assert!(response.relay_response().relay_server.is_empty());
++                assert_eq!(response.relay_response().refuse_reason,
++                    "Você precisa entrar na sua conta do RustDesk para acessar este dispositivo");
++            }
++        }
 +    }
 +
 +    #[tokio::test]

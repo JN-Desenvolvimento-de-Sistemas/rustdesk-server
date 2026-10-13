@@ -75,6 +75,7 @@ pub enum ApiFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Authorization {
     Allowed,
+    LoginRequired,
     Denied,
     Unavailable(ApiFailure),
 }
@@ -83,6 +84,7 @@ impl Authorization {
     pub fn message(self) -> Option<&'static str> {
         match self {
             Self::Allowed => None,
+            Self::LoginRequired => Some("Você precisa entrar na sua conta do RustDesk para acessar este dispositivo"),
             Self::Denied => Some("Você não possui permissão para acessar esse dispositivo. Entre em contato com o administrador"),
             Self::Unavailable(_) => Some("Serviço temporariamente indisponível. Tente novamente em instantes"),
         }
@@ -164,7 +166,8 @@ pub async fn connection_authorization(body: serde_json::Value) -> Authorization 
 }
 
 pub async fn authorize(token: &str, destination: &str, identity: Option<serde_json::Value>) -> Authorization {
-    if token.is_empty() || identity.is_none() { return Authorization::Denied; }
+    if token.is_empty() { return Authorization::LoginRequired; }
+    if identity.is_none() { return Authorization::Denied; }
     connection_authorization(serde_json::json!({"token": token, "destination_id": destination, "destination_identity": identity, "attempt_id": uuid::Uuid::new_v4().to_string()})).await
 }
 
@@ -188,7 +191,7 @@ mod tests {
             let request = RendezvousMessage::parse_from_bytes(&received).unwrap();
             assert_eq!(request.punch_hole_request().token, "test-token");
             framed.send(received.freeze()).await.unwrap();
-            for decision in [Authorization::Denied, Authorization::Unavailable(ApiFailure::Timeout)] {
+            for decision in [Authorization::LoginRequired, Authorization::Denied, Authorization::Unavailable(ApiFailure::Timeout)] {
                 let received = framed.next().await.unwrap().unwrap();
                 assert!(RendezvousMessage::parse_from_bytes(&received).unwrap().has_punch_hole_request());
                 framed.send(decision.punch_response().unwrap().write_to_bytes().unwrap().into()).await.unwrap();
@@ -211,6 +214,12 @@ mod tests {
         client.send(&request).await.unwrap();
         let echoed = client.next_timeout(5000).await.unwrap().unwrap();
         assert_eq!(RendezvousMessage::parse_from_bytes(&echoed).unwrap().punch_hole_request().token, "test-token");
+        client.send(&request).await.unwrap();
+        let login_required = client.next_timeout(5000).await.unwrap().unwrap();
+        let login_required = RendezvousMessage::parse_from_bytes(&login_required).unwrap();
+        assert!(login_required.punch_hole_response().socket_addr.is_empty());
+        assert_eq!(login_required.punch_hole_response().other_failure,
+            "Você precisa entrar na sua conta do RustDesk para acessar este dispositivo");
         client.send(&request).await.unwrap();
         let denied = client.next_timeout(5000).await.unwrap().unwrap();
         let denied = RendezvousMessage::parse_from_bytes(&denied).unwrap();
@@ -294,7 +303,7 @@ mod tests {
         assert!(configured_base("https://api.example.org", &"a".repeat(32)).is_ok());
         assert!(Authorization::Allowed.punch_response().is_none());
         assert!(Authorization::Allowed.relay_response().is_none());
-        for decision in [Authorization::Denied, Authorization::Unavailable(ApiFailure::Configuration), Authorization::Unavailable(ApiFailure::Timeout)] {
+        for decision in [Authorization::LoginRequired, Authorization::Denied, Authorization::Unavailable(ApiFailure::Configuration), Authorization::Unavailable(ApiFailure::Timeout)] {
             let punch = decision.punch_response().unwrap();
             assert!(punch.punch_hole_response().socket_addr.is_empty());
             assert_eq!(punch.punch_hole_response().other_failure, decision.message().unwrap());
